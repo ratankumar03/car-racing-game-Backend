@@ -116,7 +116,12 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # CORS Settings
-CORS_ALLOW_ALL_ORIGINS = True
+# Explicitly allow frontend origins to ensure CORS headers are returned in production.
+CORS_ALLOW_ALL_ORIGINS = False
+CORS_ALLOWED_ORIGINS = [
+    'https://car-racing-game-frontend.onrender.com',
+    'http://localhost:3000',
+]
 CORS_ALLOW_CREDENTIALS = True
 
 # REST Framework
