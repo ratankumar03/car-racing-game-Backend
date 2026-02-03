@@ -2,45 +2,139 @@
 MongoDB Database Operations for Racing Game
 """
 from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 from django.conf import settings
 from datetime import datetime
 from bson import ObjectId
+import copy
+
+class _InsertResult:
+    def __init__(self, inserted_id):
+        self.inserted_id = inserted_id
+
+class _QueryResult:
+    def __init__(self, items):
+        self._items = items
+
+    def sort(self, key, direction):
+        reverse = direction == -1
+        self._items.sort(key=lambda item: item.get(key), reverse=reverse)
+        return self
+
+    def limit(self, count):
+        self._items = self._items[:count]
+        return self
+
+    def __iter__(self):
+        return iter(self._items)
+
+class _InMemoryCollection:
+    def __init__(self):
+        self._items = []
+
+    def insert_one(self, doc):
+        new_doc = copy.deepcopy(doc)
+        if '_id' not in new_doc:
+            new_doc['_id'] = ObjectId()
+        self._items.append(new_doc)
+        return _InsertResult(new_doc['_id'])
+
+    def find_one(self, filter=None):
+        filter = filter or {}
+        for item in self._items:
+            if _matches_filter(item, filter):
+                return copy.deepcopy(item)
+        return None
+
+    def find(self, filter=None):
+        filter = filter or {}
+        items = [copy.deepcopy(item) for item in self._items if _matches_filter(item, filter)]
+        return _QueryResult(items)
+
+    def update_one(self, filter, update):
+        for idx, item in enumerate(self._items):
+            if _matches_filter(item, filter):
+                if '$set' in update:
+                    for key, value in update['$set'].items():
+                        item[key] = value
+                if '$inc' in update:
+                    for key, value in update['$inc'].items():
+                        item[key] = item.get(key, 0) + value
+                self._items[idx] = item
+                return
+
+def _matches_filter(item, filter):
+    for key, expected in filter.items():
+        if key not in item or item[key] != expected:
+            return False
+    return True
+
+def _safe_object_id(value):
+    try:
+        return ObjectId(str(value))
+    except Exception:
+        return None
 
 class MongoDB:
     """MongoDB Connection and Operations"""
 
     def __init__(self):
-        # Use MongoDB Atlas URI if available, otherwise use local connection
+        # Use MongoDB Atlas URI if available, otherwise use local connection.
+        # Fall back to in-memory collections if connection fails.
         mongodb_uri = settings.MONGODB_SETTINGS.get('uri')
-        if mongodb_uri:
-            # Production: MongoDB Atlas
-            self.client = MongoClient(mongodb_uri)
-        else:
-            # Development: Local MongoDB
-            self.client = MongoClient(
-                settings.MONGODB_SETTINGS['host'],
-                settings.MONGODB_SETTINGS['port']
-            )
-        self.db = self.client[settings.MONGODB_SETTINGS['db']]
-        
+        self.client = None
+        self.db = None
+        try:
+            if mongodb_uri:
+                # Production: MongoDB Atlas
+                self.client = MongoClient(
+                    mongodb_uri,
+                    serverSelectionTimeoutMS=5000,
+                    connectTimeoutMS=5000,
+                    socketTimeoutMS=5000,
+                )
+            else:
+                # Development: Local MongoDB
+                self.client = MongoClient(
+                    settings.MONGODB_SETTINGS['host'],
+                    settings.MONGODB_SETTINGS['port'],
+                    serverSelectionTimeoutMS=3000,
+                    connectTimeoutMS=3000,
+                    socketTimeoutMS=3000,
+                )
+            self.client.admin.command('ping')
+            self.db = self.client[settings.MONGODB_SETTINGS['db']]
+        except PyMongoError:
+            self.client = None
+            self.db = None
+
         # Collections
-        self.players = self.db['players']
-        self.cars = self.db['cars']
-        self.levels = self.db['levels']
-        self.game_sessions = self.db['game_sessions']
-        self.leaderboard = self.db['leaderboard']
-        self.car_customizations = self.db['car_customizations']
-        
+        if self.db is not None:
+            self.players = self.db['players']
+            self.cars = self.db['cars']
+            self.levels = self.db['levels']
+            self.game_sessions = self.db['game_sessions']
+            self.leaderboard = self.db['leaderboard']
+            self.car_customizations = self.db['car_customizations']
+        else:
+            self.players = _InMemoryCollection()
+            self.cars = _InMemoryCollection()
+            self.levels = _InMemoryCollection()
+            self.game_sessions = _InMemoryCollection()
+            self.leaderboard = _InMemoryCollection()
+            self.car_customizations = _InMemoryCollection()
+
     def close(self):
         """Close MongoDB connection"""
-        self.client.close()
+        if self.client:
+            self.client.close()
 
 # Global MongoDB instance
 mongo_db = MongoDB()
 
 class PlayerDB:
     """Player Database Operations"""
-    
+
     @staticmethod
     def create_player(username, email):
         """Create a new player"""
@@ -59,15 +153,16 @@ class PlayerDB:
         result = mongo_db.players.insert_one(player)
         player['_id'] = str(result.inserted_id)
         return player
-    
+
     @staticmethod
     def get_player(player_id):
         """Get player by ID"""
-        player = mongo_db.players.find_one({'_id': ObjectId(player_id)})
+        oid = _safe_object_id(player_id)
+        player = mongo_db.players.find_one({'_id': oid if oid else player_id})
         if player:
             player['_id'] = str(player['_id'])
         return player
-    
+
     @staticmethod
     def get_player_by_username(username):
         """Get player by username"""
@@ -75,19 +170,21 @@ class PlayerDB:
         if player:
             player['_id'] = str(player['_id'])
         return player
-    
+
     @staticmethod
     def update_player(player_id, update_data):
         """Update player data"""
+        oid = _safe_object_id(player_id)
         mongo_db.players.update_one(
-            {'_id': ObjectId(player_id)},
+            {'_id': oid if oid else player_id},
             {'$set': update_data}
         )
         return PlayerDB.get_player(player_id)
-    
+
     @staticmethod
     def update_player_stats(player_id, won=False):
         """Update player statistics after race"""
+        oid = _safe_object_id(player_id)
         update = {
             '$inc': {
                 'total_races': 1,
@@ -96,12 +193,12 @@ class PlayerDB:
                 'coins': 100 if won else 20
             }
         }
-        mongo_db.players.update_one({'_id': ObjectId(player_id)}, update)
+        mongo_db.players.update_one({'_id': oid if oid else player_id}, update)
         return PlayerDB.get_player(player_id)
 
 class CarDB:
     """Car Database Operations"""
-    
+
     @staticmethod
     def create_car(player_id, car_data):
         """Create a new car for player"""
@@ -127,15 +224,16 @@ class CarDB:
         result = mongo_db.cars.insert_one(car)
         car['_id'] = str(result.inserted_id)
         return car
-    
+
     @staticmethod
     def get_car(car_id):
         """Get car by ID"""
-        car = mongo_db.cars.find_one({'_id': ObjectId(car_id)})
+        oid = _safe_object_id(car_id)
+        car = mongo_db.cars.find_one({'_id': oid if oid else car_id})
         if car:
             car['_id'] = str(car['_id'])
         return car
-    
+
     @staticmethod
     def get_player_cars(player_id):
         """Get all cars owned by player"""
@@ -143,22 +241,24 @@ class CarDB:
         for car in cars:
             car['_id'] = str(car['_id'])
         return cars
-    
+
     @staticmethod
     def update_car(car_id, update_data):
         """Update car specifications"""
+        oid = _safe_object_id(car_id)
         update_data['updated_at'] = datetime.now()
         mongo_db.cars.update_one(
-            {'_id': ObjectId(car_id)},
+            {'_id': oid if oid else car_id},
             {'$set': update_data}
         )
         return CarDB.get_car(car_id)
-    
+
     @staticmethod
     def upgrade_car(car_id, upgrade_type, amount):
         """Upgrade car attribute"""
+        oid = _safe_object_id(car_id)
         mongo_db.cars.update_one(
-            {'_id': ObjectId(car_id)},
+            {'_id': oid if oid else car_id},
             {
                 '$inc': {upgrade_type: amount},
                 '$set': {'updated_at': datetime.now()}
@@ -168,7 +268,7 @@ class CarDB:
 
 class LevelDB:
     """Level Database Operations"""
-    
+
     @staticmethod
     def initialize_levels():
         """Initialize game levels"""
@@ -242,8 +342,7 @@ class LevelDB:
                     'time_of_day': 'night',
                     'obstacles': ['puddles', 'traffic', 'pedestrians']
                 }
-            }
-            ,
+            },
             {
                 'level_number': 6,
                 'name': 'Mountain Road',
@@ -301,12 +400,12 @@ class LevelDB:
                 }
             }
         ]
-        
+
         for level in levels:
             existing = mongo_db.levels.find_one({'level_number': level['level_number']})
             if not existing:
                 mongo_db.levels.insert_one(level)
-    
+
     @staticmethod
     def get_level(level_number):
         """Get level by number"""
@@ -314,7 +413,7 @@ class LevelDB:
         if level:
             level['_id'] = str(level['_id'])
         return level
-    
+
     @staticmethod
     def get_all_levels():
         """Get all levels"""
@@ -325,7 +424,7 @@ class LevelDB:
 
 class GameSessionDB:
     """Game Session Database Operations"""
-    
+
     @staticmethod
     def create_session(player_id, level_number, car_id):
         """Create a new game session"""
@@ -346,24 +445,26 @@ class GameSessionDB:
         result = mongo_db.game_sessions.insert_one(session)
         session['_id'] = str(result.inserted_id)
         return session
-    
+
     @staticmethod
     def update_session(session_id, update_data):
         """Update game session"""
+        oid = _safe_object_id(session_id)
         mongo_db.game_sessions.update_one(
-            {'_id': ObjectId(session_id)},
+            {'_id': oid if oid else session_id},
             {'$set': update_data}
         )
         return GameSessionDB.get_session(session_id)
-    
+
     @staticmethod
     def get_session(session_id):
         """Get session by ID"""
-        session = mongo_db.game_sessions.find_one({'_id': ObjectId(session_id)})
+        oid = _safe_object_id(session_id)
+        session = mongo_db.game_sessions.find_one({'_id': oid if oid else session_id})
         if session:
             session['_id'] = str(session['_id'])
         return session
-    
+
     @staticmethod
     def complete_session(session_id, position, score):
         """Complete a game session"""
@@ -378,7 +479,7 @@ class GameSessionDB:
 
 class LeaderboardDB:
     """Leaderboard Database Operations"""
-    
+
     @staticmethod
     def add_score(player_id, level_number, score, time):
         """Add score to leaderboard"""
@@ -389,13 +490,13 @@ class LeaderboardDB:
             'time': time,
             'created_at': datetime.now()
         }
-        
+
         # Check if player has existing score for this level
         existing = mongo_db.leaderboard.find_one({
             'player_id': player_id,
             'level_number': level_number
         })
-        
+
         if existing:
             # Update if new score is better
             if score > existing['score']:
@@ -405,18 +506,18 @@ class LeaderboardDB:
                 )
         else:
             mongo_db.leaderboard.insert_one(entry)
-    
+
     @staticmethod
     def get_leaderboard(level_number=None, limit=10):
         """Get leaderboard entries"""
         query = {'level_number': level_number} if level_number else {}
         entries = list(mongo_db.leaderboard.find(query).sort('score', -1).limit(limit))
-        
+
         # Get player details
         for entry in entries:
             entry['_id'] = str(entry['_id'])
             player = PlayerDB.get_player(entry['player_id'])
             if player:
                 entry['username'] = player['username']
-        
+
         return entries
